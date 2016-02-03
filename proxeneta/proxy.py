@@ -3,9 +3,7 @@ import requests
 import logging
 import time
 
-from requests.exceptions import ConnectTimeout
-
-from proxeneta.utils import timecall
+from proxeneta.utils import timecall, chunks
 
 
 logger = logging.getLogger(__name__)
@@ -14,6 +12,9 @@ logger = logging.getLogger(__name__)
 TEST_URL = 'http://google.com/'
 PROXY_TIMEOUT = 5
 PROXY_TTL = 120
+PROXY_ROTATION_INTERVAL = 20
+MAX_THREADS = 100
+LOG_FILE = 'proxeneta.log'
 
 
 class Proxy(object):
@@ -21,31 +22,47 @@ class Proxy(object):
     def __init__(self, host, port):
         self.host = host
         self.port = port
-        self.creation_time = time.time()
-        self.last_time = -float('inf')
+        self.last_check_time = -float('inf')
+        self.last_use_time = -float('inf')
         self.response_time = float('inf')
-        self.checked = False
+        self.valid = None
+
+    @property
+    def available(self):
+        elapsed_time = time.time() - self.last_use_time
+        return self.valid and elapsed_time > PROXY_ROTATION_INTERVAL
 
     def check(self):
-        if self.checked and time.time() - self.creation_time < PROXY_TTL:
-            return True
-        return self._check()
+        if time.time() - self.last_check_time < PROXY_TTL:
+            # check expired
+            self.valid = None
+            self.response_time = float('inf')
+            self.last_check_time = -float('inf')
+            self.last_use_time = -float('inf')
+        return self._check() if self.valid == None else self.valid
 
     def _check(self):
         try:
-            logger.info("Checking %s", self.url)
+            logger.debug("Checking %s", self.url)
             proxies = {'http': self.url}
-            time, response = timecall(
+            call_time, response = timecall(
                 lambda: requests.get(TEST_URL,
                                      proxies=proxies,
                                      timeout=PROXY_TIMEOUT))
             if response.status_code == 200:
-                logger.info("Check %s successful", self.url)
-                self.response_time = time
-                self.checked = True
+                logger.debug("Check %s successful", self.url)
+                self.response_time = call_time
+                self.last_check_time = time.time()
+                self.valid = True
                 return True
-        except ConnectTimeout as e:
-            logger.error("Check %s failed: %s", self.url, e)
+            else:
+                raise Exception(response.content)
+        except Exception as e:
+            logger.debug("Check %s failed: %s", self.url, e)
+        self.valid = False
+        self.response_time = float('inf')
+        self.last_use_time = float('inf')
+        self.last_check_time = float('inf')
         return False
 
     @property
@@ -58,62 +75,85 @@ class Proxy(object):
 
     def __str__(self):
         return self.url
-            
 
-class Pool(threading.Thread):
+    def __eq__(self, other):
+        return self.url == other.url
 
-    def __init__(self, provider, size=20, rotation_interval=30):
-        super(Pool, self).__init__()
-        self.setDaemon(True)
+
+class Pool(object):
+
+    def __init__(self, provider):
         self.provider = provider
-        self.size = size
-        self.rotation_interval = rotation_interval
         self._proxies = []
         self._cond = threading.Condition()
+        self._start()
 
-    def refresh(self):
-        logger.info("Refreshing pool...")
-        self._cond.acquire()
-        proxies = self._proxies + self.provider.get()
-        proxies = self._filter_expired(proxies)
-        proxies = self._sort_by_response_time(proxies)
-        self._proxies = proxies
-        logger.info("Pool refreshed: %d proxies", len(proxies))
-        self._cond.notify_all()
-        self._cond.release()
-
-    def run(self):
-        while True:
-            if len(self.proxies) < self.size:
-                self.refresh()
-            time.sleep(1)
+    def _start(self):
+        def start_thread(fn):
+            thread = threading.Thread(target=fn)
+            thread.setDaemon(True)
+            thread.start()
+        start_thread(self._add_from_provider)
+        start_thread(self._check)
+        start_thread(self._log)
 
     @property
     def proxies(self):
-        return self._filter_recently_used(self._proxies)
+        proxies = [p for p in self._proxies if p.available]
+        return sorted(proxies, key=lambda p: p.response_time)
 
     def get(self):
         self._cond.acquire()
         proxies = self.proxies
+        if proxies == []:
+            logger.debug("Pool is empty, waiting...")
         while proxies == []:
-            logger.info("Pool is empty, waiting...")
             self._cond.wait()
             proxies = self.proxies
         proxy = proxies[0]
-        proxy.last_time = time.time()
+        proxy.last_use_time = time.time()
         logger.info("Proxy %s provided", proxy)
         self._cond.release()
         return proxy
 
-    def _sort_by_response_time(self, proxies):
-        return sorted(proxies, key=lambda p: p.response_time)
+    def _check(self):
+        def loop(partition_number):
+            while True:
+                for idx, proxy in enumerate(self._proxies):
+                    if idx % MAX_THREADS == partition_number:
+                        if proxy.check() and proxy.available:
+                            self._cond.acquire()
+                            self._cond.notify_all()
+                            self._cond.release()
+                time.sleep(1)
+        for idx in range(MAX_THREADS):
+            threading.Thread(target=loop, args=(idx,)).start()
 
-    def _filter_recently_used(self, proxies):
-        return [p for p in proxies
-                if time.time() - p.last_time > self.rotation_interval]
+    def _add_from_provider(self):
+        while True:
+            count = 0
+            for proxy in self.provider.get():
+                if proxy not in self._proxies:
+                    self._proxies.append(proxy)
+                    count += 1
+            logger.info("%d new proxies found", count)
+            time.sleep(10)
 
-    def _filter_expired(self, proxies):
-        count = len(proxies)
-        proxies = [p for p in proxies if p.check()]
-        logger.info("%d proxies expired", count - len(proxies))
-        return proxies
+    def _log(self):
+        while True:
+            with open(LOG_FILE, 'w') as f:
+                proxies = sorted(self._proxies, key=lambda p: p.response_time)
+                valid = [p for p in self._proxies if p.valid]
+                available = [p for p in self._proxies if p.available]
+                log = '{available} available / {total} total\n'.format(
+                    available=len(available), total=len(valid))
+                log += 'PROXY\tRESPONSE TIME\tVALID\tAVAILABLE\n'
+                for proxy in proxies:
+                    line = []
+                    line.append(proxy.url)
+                    line.append(str(proxy.response_time))
+                    line.append(str(proxy.valid))
+                    line.append(str(proxy.available))
+                    log += '\t'.join(line) + '\n'
+                f.write(log)
+            time.sleep(3)

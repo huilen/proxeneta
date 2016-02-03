@@ -18,14 +18,14 @@ LIMITS = {10: 10,
           60: 20,
           120: 30}
 TOTAL_REQUESTS = 100
-TEST_PROXY_HOST = '181.14.245.194'
-TEST_PROXY_PORT = 8000
+TEST_PROXY_HOST = '52.33.141.184'
+TEST_PROXY_PORT = 80
 
 
 class TestProxy(BaseTestCase):
 
     def test_check(self):
-        invalid_proxy = Proxy(host='185.92.220.84', port=3128)
+        invalid_proxy = Proxy(host=TEST_PROXY_HOST, port=1)
         valid_proxy = Proxy(host=TEST_PROXY_HOST, port=TEST_PROXY_PORT)
         self.assertFalse(invalid_proxy.check())
         self.assertTrue(valid_proxy.check())
@@ -34,15 +34,8 @@ class TestProxy(BaseTestCase):
 class TestPool(BaseTestCase):
 
     def test_proxy_rotation(self):
-        self._test_proxy_rotation(1)
-        self.assertRaises(AssertionError, lambda: self._test_proxy_rotation(.001))
-
-    def _test_proxy_rotation(self, rotation_interval):
         requests = defaultdict(list)
-        pool = Pool(MockProvider(),
-                    size=TOTAL_REQUESTS / 4,
-                    rotation_interval=rotation_interval)
-        pool.start()
+        pool = Pool(MockProvider())
 
         def request(proxy):
             logger.info("Request through proxy %s", proxy)
