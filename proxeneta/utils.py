@@ -12,3 +12,10 @@ def chunks(iterable, number):
     size = round(len(iterable) / number) + 1
     for i in range(0, len(iterable), size):
         yield iterable[i:i+size]
+
+
+def secure_round(n):
+    try:
+        return int(n)
+    except Exception:
+        return n
